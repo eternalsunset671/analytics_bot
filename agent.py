@@ -23,7 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from llm import chat_completion
+from llm import LLMRateLimitError, chat_completion
 from settings import settings
 
 logger = logging.getLogger(__name__)
@@ -401,6 +401,16 @@ def run_agent(
         for step in range(MAX_ITERATIONS):
             try:
                 msg = chat_completion(messages, tools=[PYTHON_EXEC_TOOL])
+            except LLMRateLimitError as e:
+                logger.warning("LLM rate-limited at step %d: %s", step, e)
+                final_report = (
+                    "⏳ Groq API временно ограничивает запросы (rate limit). "
+                    "Это часто бывает на бесплатном тарифе при больших датасетах "
+                    "или серии запусков подряд. Подождите 30–60 секунд и попробуйте снова."
+                )
+                trace.section(f"STEP {step + 1} — RATE LIMIT", str(e))
+                trace.final(final_report, len(charts))
+                return final_report, charts, trace.path
             except Exception as e:
                 logger.error("LLM error at step %d: %s", step, e)
                 final_report = f"Ошибка LLM: {e}"
