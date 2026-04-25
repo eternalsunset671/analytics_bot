@@ -178,11 +178,14 @@ def _parse_args(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 async def _run_and_send(update: Update, df, instruction: str, focus_hint: str | None = None):
     await update.message.reply_text("🤖 Агент запускается и пишет код для анализа…")
-    kwargs = {"user_instruction": instruction}
+    kwargs = {
+        "user_instruction": instruction,
+        "trace_label": update.effective_chat.id,
+    }
     if focus_hint:
         kwargs["focus_hint"] = focus_hint
     try:
-        report, charts = run_agent(df, **kwargs)
+        report, charts, trace_path = run_agent(df, **kwargs)
     except Exception as e:
         logger.exception("agent failed")
         await update.message.reply_text(f"Ошибка агента: {e}")
@@ -190,6 +193,17 @@ async def _run_and_send(update: Update, df, instruction: str, focus_hint: str | 
 
     await safe_reply(update, f"🧠 *Отчёт агента*\n\n{report}")
     await send_charts(update, charts)
+
+    if trace_path and os.path.exists(trace_path):
+        try:
+            with open(trace_path, "rb") as fh:
+                await update.message.reply_document(
+                    document=fh,
+                    filename=os.path.basename(trace_path),
+                    caption="📝 Трейс агента: рассуждения LLM и сгенерированный код по шагам.",
+                )
+        except Exception as e:
+            logger.warning("Не удалось отправить трейс: %s", e)
 
 
 async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):

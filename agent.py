@@ -6,9 +6,11 @@ LLM сама решает, какой код выполнить, смотрит 
 
 from __future__ import annotations
 
+import datetime as _dt
 import io
 import json
 import logging
+import os
 import re
 import threading
 import traceback
@@ -22,6 +24,7 @@ import numpy as np
 import pandas as pd
 
 from llm import chat_completion
+from settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,8 @@ EXEC_TIMEOUT_SEC = 25
 MAX_TOOL_OUTPUT_CHARS = 4000
 MAX_CHARTS = 8
 MAX_INSTRUCTION_LEN = 1000
+
+TRACES_DIR = os.path.join(os.path.dirname(__file__), "traces")
 
 # Паттерны, которые никогда не должны появляться в коде, сгенерированном LLM.
 # Основная цель — не допустить побочных эффектов вне анализа данных.
@@ -238,14 +243,107 @@ def _build_system_prompt(focus_hint: str) -> str:
     )
 
 
+class _NullTrace:
+    """Заглушка для случая, когда DEBUG_TRACES=false. Все методы — no-op."""
+
+    path: str | None = None
+
+    def section(self, title: str, body: str) -> None:  # noqa: D401
+        return None
+
+    def step(self, step_idx: int, reasoning: str, tool_calls: list[dict]) -> None:
+        return None
+
+    def tool_result(self, tool_call_idx: int, result: str) -> None:
+        return None
+
+    def final(self, report: str, charts_count: int) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+class _Trace:
+    """Подробный лог одного запуска агента: системный промпт, инструкция пользователя,
+    рассуждения LLM на каждой итерации, сгенерированный код, ответы инструмента и финальный отчёт."""
+
+    def __init__(self, label: str | int | None) -> None:
+        os.makedirs(TRACES_DIR, exist_ok=True)
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_label = re.sub(r"[^A-Za-z0-9_-]", "_", str(label or "anon"))[:32]
+        self.path = os.path.join(TRACES_DIR, f"trace_{safe_label}_{ts}.txt")
+        self._fh = open(self.path, "w", encoding="utf-8")
+        self._write_header(ts)
+
+    def _write_header(self, ts: str) -> None:
+        self._fh.write("=" * 80 + "\n")
+        self._fh.write(f"AGENT TRACE — {ts}\n")
+        self._fh.write("=" * 80 + "\n\n")
+
+    def section(self, title: str, body: str) -> None:
+        self._fh.write(f"\n----- {title} -----\n")
+        self._fh.write((body or "").rstrip() + "\n")
+        self._fh.flush()
+
+    def step(self, step_idx: int, reasoning: str, tool_calls: list[dict]) -> None:
+        self._fh.write(f"\n========== STEP {step_idx + 1} ==========\n")
+        if reasoning.strip():
+            self._fh.write("LLM reasoning / message:\n")
+            self._fh.write(reasoning.rstrip() + "\n")
+        else:
+            self._fh.write("LLM reasoning / message: (пусто — LLM сразу вызвала инструмент)\n")
+        for i, tc in enumerate(tool_calls, 1):
+            fn = tc.get("function", {})
+            name = fn.get("name", "?")
+            raw_args = fn.get("arguments", "")
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception:
+                args = {"_raw": str(raw_args)}
+            code = args.get("code", "") if isinstance(args, dict) else ""
+            self._fh.write(f"\n>>> tool_call #{i}: {name}\n")
+            if code:
+                self._fh.write("--- code ---\n")
+                self._fh.write(code.rstrip() + "\n")
+                self._fh.write("------------\n")
+            else:
+                self._fh.write(f"args: {json.dumps(args, ensure_ascii=False)[:1000]}\n")
+        self._fh.flush()
+
+    def tool_result(self, tool_call_idx: int, result: str) -> None:
+        self._fh.write(f"\n<<< tool_result #{tool_call_idx}:\n")
+        self._fh.write(result.rstrip() + "\n")
+        self._fh.flush()
+
+    def final(self, report: str, charts_count: int) -> None:
+        self._fh.write("\n========== FINAL REPORT ==========\n")
+        self._fh.write(report.rstrip() + "\n")
+        self._fh.write(f"\n[charts saved: {charts_count}]\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+
 def run_agent(
     df: pd.DataFrame,
     user_instruction: str = "",
     focus_hint: str = "Проведи всесторонний разведочный анализ датасета.",
-) -> tuple[str, list[io.BytesIO]]:
-    """Запускает агентный цикл. Возвращает (финальный_текст, список_графиков)."""
+    trace_label: str | int | None = None,
+) -> tuple[str, list[io.BytesIO], str | None]:
+    """Запускает агентный цикл.
+
+    Возвращает (финальный_текст, список_графиков, путь_к_трейсу).
+    Путь_к_трейсу — None, если DEBUG_TRACES=false в .env.
+    """
     charts: list[io.BytesIO] = []
     instruction, suspicious = sanitize_instruction(user_instruction)
+
+    trace: _Trace | _NullTrace = _Trace(trace_label) if settings.debug_traces else _NullTrace()
 
     columns_preview = ", ".join(f"{c} ({df[c].dtype})" for c in df.columns[:40])
     if len(df.columns) > 40:
@@ -268,59 +366,83 @@ def run_agent(
         "и df.describe(include='all')."
     )
 
+    system_prompt = _build_system_prompt(focus_hint)
+
+    trace.section("DATASET", f"{len(df)} rows × {len(df.columns)} cols\nColumns: {columns_preview}")
+    trace.section(
+        "USER INSTRUCTION",
+        (instruction or "(не задано)") + (f"\n[suspicious=True — детектор prompt-injection]" if suspicious else ""),
+    )
+    trace.section("FOCUS HINT", focus_hint)
+    trace.section("SYSTEM PROMPT", system_prompt)
+    trace.section("USER MESSAGE", user_content)
+
     messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(focus_hint)},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
     ]
 
-    for step in range(MAX_ITERATIONS):
-        try:
-            msg = chat_completion(messages, tools=[PYTHON_EXEC_TOOL])
-        except Exception as e:
-            logger.error("LLM error at step %d: %s", step, e)
-            return f"Ошибка LLM: {e}", charts
-
-        tool_calls = msg.get("tool_calls") or []
-
-        # Приводим ассистентское сообщение к виду, который Groq принимает обратно.
-        assistant_entry: dict = {
-            "role": "assistant",
-            "content": msg.get("content") or "",
-        }
-        if tool_calls:
-            assistant_entry["tool_calls"] = tool_calls
-        messages.append(assistant_entry)
-
-        if not tool_calls:
-            final = (msg.get("content") or "").strip()
-            return final or "(LLM вернула пустой ответ.)", charts
-
-        for tc in tool_calls:
-            name = tc.get("function", {}).get("name")
-            args_raw = tc.get("function", {}).get("arguments", "{}")
+    final_report: str
+    try:
+        for step in range(MAX_ITERATIONS):
             try:
-                args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
-            except Exception:
-                args = {}
+                msg = chat_completion(messages, tools=[PYTHON_EXEC_TOOL])
+            except Exception as e:
+                logger.error("LLM error at step %d: %s", step, e)
+                final_report = f"Ошибка LLM: {e}"
+                trace.section(f"STEP {step + 1} — LLM ERROR", str(e))
+                trace.final(final_report, len(charts))
+                return final_report, charts, trace.path
 
-            if name == "python_exec":
-                code = args.get("code", "") or ""
-                logger.info("agent step %d: python_exec\n%s", step, code[:400])
-                result = run_code(code, df, charts)
-            else:
-                result = f"ERROR: неизвестный инструмент '{name}'."
+            tool_calls = msg.get("tool_calls") or []
+            reasoning = msg.get("content") or ""
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.get("id"),
-                    "name": name or "python_exec",
-                    "content": result,
-                }
-            )
+            trace.step(step, reasoning, tool_calls)
 
-    return (
-        "Агент достиг лимита итераций, не завершив отчёт. "
-        "Попробуйте сформулировать более узкую инструкцию.",
-        charts,
-    )
+            assistant_entry: dict = {
+                "role": "assistant",
+                "content": reasoning,
+            }
+            if tool_calls:
+                assistant_entry["tool_calls"] = tool_calls
+            messages.append(assistant_entry)
+
+            if not tool_calls:
+                final_report = reasoning.strip() or "(LLM вернула пустой ответ.)"
+                trace.final(final_report, len(charts))
+                return final_report, charts, trace.path
+
+            for i, tc in enumerate(tool_calls, 1):
+                name = tc.get("function", {}).get("name")
+                args_raw = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else (args_raw or {})
+                except Exception:
+                    args = {}
+
+                if name == "python_exec":
+                    code = args.get("code", "") or ""
+                    logger.info("agent step %d: python_exec\n%s", step, code[:400])
+                    result = run_code(code, df, charts)
+                else:
+                    result = f"ERROR: неизвестный инструмент '{name}'."
+
+                trace.tool_result(i, result)
+
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.get("id"),
+                        "name": name or "python_exec",
+                        "content": result,
+                    }
+                )
+
+        final_report = (
+            "Агент достиг лимита итераций, не завершив отчёт. "
+            "Попробуйте сформулировать более узкую инструкцию."
+        )
+        trace.final(final_report, len(charts))
+        return final_report, charts, trace.path
+    finally:
+        trace.close()
