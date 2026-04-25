@@ -3,6 +3,7 @@ import time
 
 import requests
 
+from llm.errors import LLMRateLimitError
 from settings import settings
 
 logger = logging.getLogger(__name__)
@@ -11,10 +12,6 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_RETRIES = 3
 MAX_BACKOFF_SEC = 30
-
-
-class LLMRateLimitError(Exception):
-    """Groq вернул 429 даже после ретраев."""
 
 
 def _parse_retry_after(value: str | None) -> float:
@@ -36,8 +33,7 @@ def chat_completion(
     """Низкоуровневый вызов Groq Chat Completions.
 
     На 429 (rate limit) уважает заголовок Retry-After и делает до MAX_RETRIES попыток
-    с экспоненциальной задержкой. На исчерпании — поднимает LLMRateLimitError
-    с понятным сообщением.
+    с экспоненциальной задержкой. На исчерпании — поднимает LLMRateLimitError.
     """
     headers = {
         "Authorization": f"Bearer {settings.groq_api_key}",

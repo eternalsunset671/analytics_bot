@@ -1,81 +1,20 @@
+"""Telegram-хендлеры команд и документов."""
+
+from __future__ import annotations
+
 import logging
 import os
-import re
 import tempfile
 
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import ContextTypes
 
-from agent import (
-    MAX_INSTRUCTION_LEN,
-    run_agent,
-    sanitize_instruction,
-)
-from analytics import load_file
-from settings import settings
+from agent import MAX_INSTRUCTION_LEN, run_agent, sanitize_instruction
+from bot.replies import safe_reply, send_charts
+from bot.state import forget_user_file, get_df, remember_user_file
+from data.loader import load_file
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
 logger = logging.getLogger(__name__)
-
-user_files: dict[int, str] = {}
-
-DEMO_FILE = os.path.join(os.path.dirname(__file__), "demo.csv")
-
-
-def get_df(chat_id: int):
-    path = user_files.get(chat_id)
-    if path and os.path.exists(path):
-        return load_file(path), False
-    if os.path.exists(DEMO_FILE):
-        return load_file(DEMO_FILE), True
-    return None, False
-
-
-def truncate(text: str, limit: int = 3500) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "\n…(обрезано)"
-
-
-async def send_charts(update: Update, charts: list):
-    for buf in charts:
-        buf.seek(0)
-        try:
-            await update.message.reply_photo(photo=buf)
-        except Exception as e:
-            logger.warning("Не удалось отправить график: %s", e)
-
-
-def escape_md(text: str) -> str:
-    """Убираем Markdown-форматирование, чтобы Telegram не сломался на парсинге."""
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-    text = re.sub(r"__(.+?)__", r"\1", text)
-    text = re.sub(r"(?<!\*)\*(?!\*)", "•", text)
-    text = text.replace("`", "'")
-    return text
-
-
-async def safe_reply(update: Update, text: str):
-    text = truncate(text)
-    try:
-        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
-    except BadRequest:
-        clean = escape_md(text)
-        try:
-            await update.message.reply_text(clean, parse_mode=ParseMode.MARKDOWN)
-        except BadRequest:
-            await update.message.reply_text(clean)
 
 
 HELP_TEXT = (
@@ -106,13 +45,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    old = user_files.pop(chat_id, None)
-    if old and os.path.exists(old):
-        try:
-            os.unlink(old)
-        except OSError:
-            pass
+    forget_user_file(update.effective_chat.id)
     await update.message.reply_text(
         "Переключено на демо-датасет (Netflix Titles, 8800+ записей).\n"
         "Отправьте /summary, /anomalies, /correlations, /trends "
@@ -135,13 +68,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tmp.close()
 
     chat_id = update.effective_chat.id
-    old = user_files.get(chat_id)
-    if old and os.path.exists(old):
-        try:
-            os.unlink(old)
-        except OSError:
-            pass
-    user_files[chat_id] = tmp.name
+    remember_user_file(chat_id, tmp.name)
 
     try:
         df = load_file(tmp.name)
@@ -178,7 +105,7 @@ def _parse_args(context: ContextTypes.DEFAULT_TYPE) -> str:
 
 async def _run_and_send(update: Update, df, instruction: str, focus_hint: str | None = None):
     await update.message.reply_text("🤖 Агент запускается и пишет код для анализа…")
-    kwargs = {
+    kwargs: dict = {
         "user_instruction": instruction,
         "trace_label": update.effective_chat.id,
     }
@@ -190,6 +117,7 @@ async def _run_and_send(update: Update, df, instruction: str, focus_hint: str | 
             "Выполни задачу, описанную в <user_instruction>, как основной фокус анализа. "
             "Не растекайся в общий разведочный обзор, если это явно не запрошено."
         )
+
     try:
         report, charts, trace_path = run_agent(df, **kwargs)
     except Exception as e:
@@ -294,31 +222,3 @@ async def trends_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "категориальных столбцов покажи топ-10."
         ),
     )
-
-
-def main():
-    if not settings.telegram_bot_token or settings.telegram_bot_token == "your_token_here":
-        print("Ошибка: укажите TELEGRAM_BOT_TOKEN в .env")
-        return
-    if not settings.groq_api_key or settings.groq_api_key == "your_api_key_here":
-        print("Ошибка: укажите GROQ_API_KEY в .env")
-        return
-
-    app = Application.builder().token(settings.telegram_bot_token).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("demo", demo_cmd))
-    app.add_handler(CommandHandler("analyze", analyze_cmd))
-    app.add_handler(CommandHandler("summary", summary_cmd))
-    app.add_handler(CommandHandler("anomalies", anomalies_cmd))
-    app.add_handler(CommandHandler("correlations", correlations_cmd))
-    app.add_handler(CommandHandler("trends", trends_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-
-    print("Бот запущен!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
