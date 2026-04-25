@@ -184,6 +184,12 @@ async def _run_and_send(update: Update, df, instruction: str, focus_hint: str | 
     }
     if focus_hint:
         kwargs["focus_hint"] = focus_hint
+    elif instruction:
+        # Свободная инструкция от пользователя — она и есть фокус.
+        kwargs["focus_hint"] = (
+            "Выполни задачу, описанную в <user_instruction>, как основной фокус анализа. "
+            "Не растекайся в общий разведочный обзор, если это явно не запрошено."
+        )
     try:
         report, charts, trace_path = run_agent(df, **kwargs)
     except Exception as e:
