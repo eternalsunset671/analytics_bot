@@ -94,8 +94,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _run_and_send(update, df, instruction)
     else:
         await update.message.reply_text(
-            "Добавьте подпись к файлу с инструкцией — или вызовите "
-            "/summary, /anomalies, /correlations, /trends или /analyze <инструкция>."
+            "Добавьте подпись к файлу с инструкцией — либо вызовите команду:\n"
+            "\n"
+            "/summary — общий разведочный анализ\n"
+            "/anomalies — фокус на выбросах и аномалиях\n"
+            "/correlations — фокус на корреляциях\n"
+            "/trends — фокус на временных трендах\n"
+            "/analyze <инструкция> — анализ по вашей инструкции"
         )
 
 
