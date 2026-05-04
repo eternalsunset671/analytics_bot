@@ -102,6 +102,33 @@ docker run --env-file .env analytic-bot
 4. Либо используйте `/demo`, а затем `/analyze <инструкция>` или один из пресетов (`/summary`, `/anomalies`, `/correlations`, `/trends`).
 5. Дождитесь отчёта агента и графиков.
 
-## Деплой
+## Примеры использования
 
-Бот задеплоен и доступен в Telegram: **@boot_analytics_bot**.
+1. Запуск `/start`
+
+![alt text](images/image.png)
+
+2. Примеры с заготовленными промптами
+
+![alt text](images/image-1.png)
+![alt text](images/image-2.png)
+![alt text](images/image-3.png)
+![alt text](images/image-4.png)
+![alt text](images/image-5.png)
+![alt text](images/image-6.png)
+
+3. Кастомная инструкция
+
+![alt text](images/image-7.png)
+![alt text](images/image-8.png)
+
+4. Загрузка нового датасета
+
+![alt text](images/image-9.png)
+5. Неудачная промпт-инъекция
+
+![alt text](images/image-10.png)
+
+6. Кастомная инструкция к новому датасету
+
+![alt text](images/image-11.png)
